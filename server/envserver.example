@@ -1,0 +1,4 @@
+DATABASE_URL=postgresql://user:password@your-neon-host/dbname?sslmode=require
+JWT_SECRET=replace-with-a-long-random-string
+PORT=4000
+CORS_ORIGIN=https://your-frontend.onrender.com
