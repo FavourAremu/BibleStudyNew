@@ -219,6 +219,105 @@ export default function App() {
   );
 }
 
+/* ── VERSE CAROUSEL ─────────────────────────────────────────────── */
+function VerseCarousel({versions,verseData,verseHasNotes,onSelect}) {
+  const [active,setActive]=useState(0);
+  const startX=React.useRef(null);
+  const containerRef=React.useRef(null);
+
+  function onTouchStart(e){startX.current=e.touches[0].clientX;}
+  function onTouchEnd(e){
+    if(startX.current===null)return;
+    const diff=startX.current-e.changedTouches[0].clientX;
+    if(Math.abs(diff)>50){
+      if(diff>0) setActive(a=>Math.min(a+1,versions.length-1));
+      else        setActive(a=>Math.max(a-1,0));
+    }
+    startX.current=null;
+  }
+
+  const v=versions[active];
+  const vd=verseData[v.code]||{loading:true,error:null,verses:[]};
+
+  return(
+    <div style={{padding:"12px 12px 0"}}>
+      {/* Version selector pills */}
+      <div style={{display:"flex",gap:6,overflowX:"auto",paddingBottom:10,WebkitOverflowScrolling:"touch",scrollbarWidth:"none"}}>
+        {versions.map((ver,i)=>(
+          <button key={ver.code} onClick={()=>setActive(i)}
+            style={{flexShrink:0,padding:"5px 14px",borderRadius:20,border:"1px solid",cursor:"pointer",
+              fontFamily:"Georgia,serif",fontSize:12,whiteSpace:"nowrap",transition:"all 0.15s",
+              background:i===active?"#a9762f":"#fffdf6",
+              color:i===active?"#fff":"#6b5d45",
+              borderColor:i===active?"#a9762f":"#e3d8bf",
+              fontWeight:i===active?700:400}}>
+            {ver.code.toUpperCase()}
+          </button>
+        ))}
+      </div>
+
+      {/* Card */}
+      <div ref={containerRef}
+        onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}
+        style={{background:"#fffdf6",border:"1px solid #e3d8bf",borderRadius:10,
+          padding:"18px 16px",boxShadow:"0 2px 12px rgba(0,0,0,0.07)",
+          minHeight:200,touchAction:"pan-y",userSelect:"text",WebkitUserSelect:"text"}}>
+
+        {/* Card header */}
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+          marginBottom:14,paddingBottom:10,borderBottom:"1px solid #ecdfc4"}}>
+          <div>
+            <span style={{fontSize:16,fontWeight:700,color:"#a9762f",letterSpacing:"0.1em"}}>{v.code.toUpperCase()}</span>
+            <span style={{fontSize:12,color:"#bdb097",fontStyle:"italic",marginLeft:8}}>{v.name}</span>
+          </div>
+          <div style={{display:"flex",gap:8,alignItems:"center"}}>
+            <button onClick={()=>setActive(a=>Math.max(a-1,0))} disabled={active===0}
+              style={{background:"none",border:"none",fontSize:18,cursor:"pointer",color:active===0?"#d8cdb4":"#a9762f",padding:"0 4px"}}>
+              ‹
+            </button>
+            <span style={{fontSize:12,color:"#9a8c6f"}}>{active+1}/{versions.length}</span>
+            <button onClick={()=>setActive(a=>Math.min(a+1,versions.length-1))} disabled={active===versions.length-1}
+              style={{background:"none",border:"none",fontSize:18,cursor:"pointer",color:active===versions.length-1?"#d8cdb4":"#a9762f",padding:"0 4px"}}>
+              ›
+            </button>
+          </div>
+        </div>
+
+        {/* Verses */}
+        {vd.loading&&(
+          <div style={{color:"#bdb097",fontSize:14,padding:"32px 0",textAlign:"center"}}>Loading…</div>
+        )}
+        {vd.error&&(
+          <div style={{color:"#b3422f",fontSize:13,padding:"12px 0"}}>{vd.error}</div>
+        )}
+        {!vd.loading&&!vd.error&&vd.verses.map(({verse,text})=>(
+          <p key={verse} onMouseUp={()=>onSelect(v.code,verse)}
+            style={{margin:"0 0 12px 0",fontSize:17,lineHeight:1.75,cursor:"text",
+              background:verseHasNotes(verse)?"#fbeec1":"transparent",
+              padding:verseHasNotes(verse)?"4px 8px":0,borderRadius:4}}>
+            <sup style={{color:"#a9762f",fontSize:12,marginRight:5,fontWeight:700}}>{verse}</sup>
+            {text}
+          </p>
+        ))}
+      </div>
+
+      {/* Dot indicators */}
+      <div style={{display:"flex",justifyContent:"center",gap:6,padding:"12px 0 4px"}}>
+        {versions.map((_,i)=>(
+          <div key={i} onClick={()=>setActive(i)}
+            style={{width:i===active?20:7,height:7,borderRadius:4,cursor:"pointer",transition:"all 0.2s",
+              background:i===active?"#a9762f":"#d8cdb4"}}/>
+        ))}
+      </div>
+
+      {/* Swipe hint — only shown until first swipe */}
+      <div style={{textAlign:"center",fontSize:11,color:"#bdb097",paddingBottom:8}}>
+        ← swipe or tap pills to change version →
+      </div>
+    </div>
+  );
+}
+
 /* ── READER TAB ─────────────────────────────────────────────────── */
 function ReaderTab({api,user,token}) {
   const [book,setBook]=useState("John");
@@ -371,30 +470,13 @@ function ReaderTab({api,user,token}) {
 
       {notesError&&<div style={{background:"#f6dede",color:"#8a3b2a",padding:"8px 16px",fontSize:13}}>{notesError}</div>}
 
-      {/* Verse cards — single column on mobile, grid on wider screens */}
-      <div style={{padding:12,display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(300px,1fr))",gap:12}}>
-        {VERSIONS.map(v=>{
-          const vd=verseData[v.code]||{loading:true,error:null,verses:[]};
-          return(
-            <div key={v.code} style={{background:"#fffdf6",border:"1px solid #e3d8bf",borderRadius:6,padding:"14px 16px",boxShadow:"0 1px 3px rgba(0,0,0,0.06)"}}>
-              <div style={{fontSize:11,letterSpacing:"0.15em",color:"#a9762f",marginBottom:10,borderBottom:"1px solid #ecdfc4",paddingBottom:6,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                <span style={{fontWeight:700}}>{v.code.toUpperCase()}</span>
-                <span style={{color:"#bdb097",fontStyle:"italic",fontSize:10}}>{v.name}</span>
-              </div>
-              {vd.loading&&<div style={{color:"#bdb097",fontSize:13,padding:"16px 0",textAlign:"center"}}>Loading…</div>}
-              {vd.error&&<div style={{color:"#b3422f",fontSize:12,padding:"8px 0"}}>{vd.error}</div>}
-              {!vd.loading&&!vd.error&&vd.verses.map(({verse,text})=>(
-                <p key={verse} onMouseUp={()=>handleSelect(v.code,verse)}
-                  style={{margin:"0 0 10px 0",fontSize:16,lineHeight:1.7,cursor:"text",
-                    background:verseHasNotes(verse)?"#fbeec1":"transparent",
-                    padding:verseHasNotes(verse)?"3px 6px":0,borderRadius:3,WebkitUserSelect:"text",userSelect:"text"}}>
-                  <sup style={{color:"#a9762f",fontSize:11,marginRight:4,fontWeight:700}}>{verse}</sup>{text}
-                </p>
-              ))}
-            </div>
-          );
-        })}
-      </div>
+      {/* Swipeable version carousel */}
+      <VerseCarousel
+        versions={VERSIONS}
+        verseData={verseData}
+        verseHasNotes={verseHasNotes}
+        onSelect={handleSelect}
+      />
 
       {/* Notes panel — slides up as bottom sheet on mobile */}
       {showNotes&&(
