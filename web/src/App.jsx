@@ -71,9 +71,22 @@ export default function App() {
   const [form,setForm]=useState({name:"",email:"",password:""});
   const [authError,setAuthError]=useState("");
   const [authLoading,setAuthLoading]=useState(false);
-  const [token,setToken]=useState(null);
-  const [user,setUser]=useState(null);
+  const [token,setToken]=useState(()=>{ try{return localStorage.getItem("ccc_token")||null;}catch{return null;} });
+  const [user,setUser]=useState(()=>{ try{const u=localStorage.getItem("ccc_user");return u?JSON.parse(u):null;}catch{return null;} });
   const [menuOpen,setMenuOpen]=useState(false);
+
+  // Persist session
+  useEffect(()=>{
+    try{
+      if(token&&user){localStorage.setItem("ccc_token",token);localStorage.setItem("ccc_user",JSON.stringify(user));}
+      else{localStorage.removeItem("ccc_token");localStorage.removeItem("ccc_user");}
+    }catch{}
+  },[token,user]);
+
+  // Restore session on mount
+  useEffect(()=>{
+    try{if(localStorage.getItem("ccc_token"))setScreen("app");}catch{}
+  },[]);
 
   async function api(path,opts={}) {
     const res=await fetch(`${API_BASE}${path}`,{
@@ -96,7 +109,7 @@ export default function App() {
     finally{setAuthLoading(false);}
   }
 
-  function logout(){setToken(null);setUser(null);setScreen("auth");setMenuOpen(false);}
+  function logout(){try{localStorage.removeItem("ccc_token");localStorage.removeItem("ccc_user");}catch{} setToken(null);setUser(null);setScreen("auth");setMenuOpen(false);}
 
   /* ── AUTH ── */
   if(screen==="auth") return(
@@ -372,6 +385,9 @@ function ReaderTab({api,user,token}) {
     if(!activeSelection||!draft.trim())return;
     setSaving(true);
     try{
+      // Screen note before saving
+      const screen=await api("/screen",{method:"POST",body:JSON.stringify({text:draft.trim(),context:"margin note"})});
+      if(!screen.allowed){setNotesError(`Note blocked by community safety filter: ${screen.reason}`);setSaving(false);return;}
       const {highlight}=await api("/highlights",{method:"POST",body:JSON.stringify({book,chapter,verse:activeSelection.verseNum,version:activeSelection.version,quote:activeSelection.quote})});
       const {comment}=await api("/comments",{method:"POST",body:JSON.stringify({book,chapter,verse:activeSelection.verseNum,highlightId:highlight.id,body:draft.trim()})});
       setNotes(prev=>[...prev,{id:comment.id,comment_id:comment.id,verse_number:activeSelection.verseNum,comment:comment.body,
@@ -617,6 +633,9 @@ function FeedTab({api,user}) {
     e.preventDefault();if(!newPost.title.trim()||!newPost.body.trim())return;
     setPosting(true);
     try{
+      // Screen content before posting
+      const screen=await api("/screen",{method:"POST",body:JSON.stringify({text:`${newPost.title} ${newPost.body}`,context:"community post"})});
+      if(!screen.allowed){setError(`Post blocked by community safety filter: ${screen.reason}`);setPosting(false);return;}
       const d=await api("/posts",{method:"POST",body:JSON.stringify({title:newPost.title.trim(),body:newPost.body.trim()})});
       setPosts(prev=>[d.post,...prev]);setNewPost({title:"",body:""});setShowCompose(false);
     }catch(e){setError(e.message);}finally{setPosting(false);}
@@ -626,6 +645,9 @@ function FeedTab({api,user}) {
     if(!commentText.trim()||!activePost)return;
     setPostingComment(true);
     try{
+      // Screen content before posting
+      const screen=await api("/screen",{method:"POST",body:JSON.stringify({text:commentText.trim(),context:"comment"})});
+      if(!screen.allowed){setError(`Comment blocked by community safety filter: ${screen.reason}`);setPostingComment(false);return;}
       const d=await api(`/posts/${activePost.id}/comments`,{method:"POST",body:JSON.stringify({body:commentText.trim()})});
       setPostComments(prev=>[...prev,d.comment]);setCommentText("");
       setActivePost(prev=>({...prev,comment_count:parseInt(prev.comment_count||0)+1}));

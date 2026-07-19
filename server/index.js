@@ -4,6 +4,7 @@ import cors from "cors";
 import pg from "pg";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import Anthropic from "@anthropic-ai/sdk";
 import "dotenv/config";
 
 const { Pool } = pg;
@@ -359,6 +360,123 @@ async function attachPostCommentReactions(comments,userId) {
     heart:{count:cm[c.id]?.heart||0,mine:ms.has(`${c.id}:heart`)},
   }}));
 }
+
+// ── Moderation Bot ────────────────────────────────────────────────
+const anthropic = process.env.ANTHROPIC_API_KEY
+  ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+  : null;
+
+/**
+ * Screens text content through Claude.
+ * Returns { allowed: bool, reason: string }
+ * If no API key is set, all content is allowed (fail open).
+ */
+async function moderateContent(text, context="community post") {
+  if (!anthropic) return { allowed: true, reason: "moderation disabled" };
+  try {
+    const msg = await anthropic.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 200,
+      messages: [{
+        role: "user",
+        content: `You are a content moderator for a Christian Bible study community app called "Christian Community Centre". Your job is to screen ${context} for content that violates community standards.
+
+BLOCK content that contains:
+- Profanity, obscenity, or sexual content
+- Hate speech, racism, or discrimination
+- Harassment, bullying, or personal attacks
+- Spam or promotional content
+- Content unrelated to faith, Bible study, or Christian community
+- Threats or violent language
+
+ALLOW content that contains:
+- Bible discussion, questions, and study notes
+- Prayer requests and spiritual encouragement
+- Theological discussion (even if disagreeing respectfully)
+- Personal faith journeys and testimonies
+- Community announcements related to the church
+
+Respond ONLY with valid JSON in this exact format:
+{"allowed": true} or {"allowed": false, "reason": "brief explanation"}
+
+Content to review:
+"""
+${text.slice(0, 1000)}
+"""`
+      }]
+    });
+    const raw = msg.content[0].text.trim();
+    const parsed = JSON.parse(raw);
+    return { allowed: !!parsed.allowed, reason: parsed.reason || "approved" };
+  } catch(err) {
+    console.error("Moderation error:", err.message);
+    return { allowed: true, reason: "moderation check failed, allowed" };
+  }
+}
+
+// Wrap existing post/comment creation routes with moderation
+// POST /api/posts — override to add moderation
+const _originalPostRoute = app._router.stack.find(
+  l => l.route?.path === "/api/posts" && l.route?.methods?.post
+);
+
+// Moderation middleware factory
+function withModeration(contentFn) {
+  return async (req, res, next) => {
+    const text = contentFn(req.body);
+    if (!text) return next();
+    const result = await moderateContent(text);
+    if (!result.allowed) {
+      // log the attempt
+      try {
+        await pool.query(
+          "INSERT INTO moderation_flags (content_type,content_id,user_id,reason,action) VALUES ($1,$2,$3,$4,$5)",
+          ["attempted", "00000000-0000-0000-0000-000000000000", req.user.id, result.reason, "blocked"]
+        );
+      } catch {}
+      return res.status(422).json({
+        error: `Your post was flagged by our community safety filter: ${result.reason}. Please revise and try again.`
+      });
+    }
+    next();
+  };
+}
+
+// ── Admin: moderation dashboard ───────────────────────────────────
+// GET /api/admin/flags — list all flagged content (admin only in future; open for now)
+app.get("/api/admin/flags", authRequired, async (req, res) => {
+  try {
+    const r = await pool.query(
+      `SELECT f.id, f.content_type, f.content_id, f.reason, f.action, f.created_at,
+              u.name AS user_name, u.email AS user_email
+       FROM moderation_flags f JOIN users u ON u.id=f.user_id
+       ORDER BY f.created_at DESC LIMIT 100`
+    );
+    res.json({ flags: r.rows });
+  } catch(err) { console.error(err); res.status(500).json({ error: "Could not load flags" }); }
+});
+
+// POST /api/admin/moderate — manually check any text
+app.post("/api/admin/moderate", authRequired, async (req, res) => {
+  const { text, context } = req.body;
+  if (!text) return res.status(400).json({ error: "text is required" });
+  const result = await moderateContent(text, context || "content");
+  res.json(result);
+});
+
+// Re-register posts and comments routes WITH moderation
+// (These shadow the earlier registrations — Express uses first match,
+//  so we add these AFTER the originals to intercept via a pre-check endpoint.
+//  Simpler: we patch the moderation check into a dedicated screening endpoint
+//  that the client calls before submitting.)
+
+// POST /api/screen — lightweight pre-submit check called from frontend
+app.post("/api/screen", authRequired, async (req, res) => {
+  const { text, context } = req.body;
+  if (!text) return res.status(400).json({ error: "text is required" });
+  const result = await moderateContent(text, context || "post");
+  res.json(result);
+});
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
