@@ -40,13 +40,8 @@ const BOOKS = [
 
 const RXNS=[{type:"amen",emoji:"🙏",label:"Amen"},{type:"pray",emoji:"✝️",label:"Pray"},{type:"heart",emoji:"❤️",label:"Heart"}];
 
-async function fetchChapter(book,chapter,version) {
-  const ref=encodeURIComponent(`${book} ${chapter}`);
-  const res=await fetch(`${BIBLE_API}/${ref}?translation=${version}`);
-  if(!res.ok) throw new Error(`${version.toUpperCase()} unavailable`);
-  const data=await res.json();
-  return (data.verses||[]).map(v=>({verse:v.verse,text:v.text.trim()}));
-}
+// Bible text is now fetched through our API (server-side cached)
+// fetchChapter is called inside ReaderTab via api()
 
 function Avatar({name,url,size=36}) {
   if(url) return <img src={url} alt={name} style={{width:size,height:size,borderRadius:"50%",objectFit:"cover",flexShrink:0}}/>;
@@ -72,27 +67,63 @@ export default function App() {
   const [authError,setAuthError]=useState("");
   const [authLoading,setAuthLoading]=useState(false);
   const [token,setToken]=useState(()=>{ try{return localStorage.getItem("ccc_token")||null;}catch{return null;} });
+  const [refreshToken,setRefreshToken]=useState(()=>{ try{return localStorage.getItem("ccc_refresh")||null;}catch{return null;} });
   const [user,setUser]=useState(()=>{ try{const u=localStorage.getItem("ccc_user");return u?JSON.parse(u):null;}catch{return null;} });
   const [menuOpen,setMenuOpen]=useState(false);
+  const [authScreen,setAuthScreen]=useState("login"); // login | forgot | reset | verify
 
   // Persist session
   useEffect(()=>{
     try{
-      if(token&&user){localStorage.setItem("ccc_token",token);localStorage.setItem("ccc_user",JSON.stringify(user));}
-      else{localStorage.removeItem("ccc_token");localStorage.removeItem("ccc_user");}
+      if(token&&user){
+        localStorage.setItem("ccc_token",token);
+        localStorage.setItem("ccc_user",JSON.stringify(user));
+      } else {
+        localStorage.removeItem("ccc_token");
+        localStorage.removeItem("ccc_user");
+        localStorage.removeItem("ccc_refresh");
+      }
     }catch{}
   },[token,user]);
+
+  useEffect(()=>{
+    try{
+      if(refreshToken) localStorage.setItem("ccc_refresh",refreshToken);
+    }catch{}
+  },[refreshToken]);
 
   // Restore session on mount
   useEffect(()=>{
     try{if(localStorage.getItem("ccc_token"))setScreen("app");}catch{}
   },[]);
 
-  async function api(path,opts={}) {
+  async function api(path,opts={},retry=true) {
     const res=await fetch(`${API_BASE}${path}`,{
       ...opts,
       headers:{"Content-Type":"application/json",...(token?{Authorization:`Bearer ${token}`}:{}),...(opts.headers||{})},
     });
+    // Auto-refresh on 401
+    if(res.status===401 && retry && refreshToken) {
+      try {
+        const rr=await fetch(`${API_BASE}/refresh`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({refreshToken})});
+        if(rr.ok){
+          const rd=await rr.json();
+          setToken(rd.token);
+          setRefreshToken(rd.refreshToken);
+          // Retry original request with new token
+          const retry_res=await fetch(`${API_BASE}${path}`,{
+            ...opts,
+            headers:{"Content-Type":"application/json",Authorization:`Bearer ${rd.token}`,...(opts.headers||{})},
+          });
+          const retry_data=await retry_res.json().catch(()=>({}));
+          if(!retry_res.ok) throw new Error(retry_data.error||"Request failed");
+          return retry_data;
+        }
+      } catch {}
+      // Refresh failed — log out
+      logout();
+      throw new Error("Session expired. Please log in again.");
+    }
     const data=await res.json().catch(()=>({}));
     if(!res.ok) throw new Error(data.error||"Request failed");
     return data;
@@ -101,15 +132,30 @@ export default function App() {
   async function handleAuth(e) {
     e.preventDefault();setAuthError("");setAuthLoading(true);
     try{
+      if(authMode==="forgot"){
+        await fetch(`${API_BASE}/forgot-password`,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email:form.email})});
+        setAuthError(""); // clear
+        alert("If that email exists, a reset link has been sent. Check your inbox.");
+        setAuthMode("login");
+        setAuthLoading(false); return;
+      }
       const path=authMode==="login"?"/login":"/signup";
       const body=authMode==="login"?{email:form.email,password:form.password}:{name:form.name,email:form.email,password:form.password};
       const data=await api(path,{method:"POST",body:JSON.stringify(body)});
-      setToken(data.token);setUser(data.user);setScreen("app");
+      setToken(data.token);
+      setRefreshToken(data.refreshToken||null);
+      setUser(data.user);setScreen("app");
     }catch(err){setAuthError(err.message);}
     finally{setAuthLoading(false);}
   }
 
-  function logout(){try{localStorage.removeItem("ccc_token");localStorage.removeItem("ccc_user");}catch{} setToken(null);setUser(null);setScreen("auth");setMenuOpen(false);}
+  async function logout(){
+    try{
+      if(token) await fetch(`${API_BASE}/logout`,{method:"POST",headers:{"Content-Type":"application/json",Authorization:`Bearer ${token}`},body:JSON.stringify({refreshToken})});
+      localStorage.removeItem("ccc_token");localStorage.removeItem("ccc_user");localStorage.removeItem("ccc_refresh");
+    }catch{}
+    setToken(null);setRefreshToken(null);setUser(null);setScreen("auth");setMenuOpen(false);
+  }
 
   /* ── AUTH ── */
   if(screen==="auth") return(
@@ -123,8 +169,11 @@ export default function App() {
         borderRadius:6,padding:"36px 24px",boxShadow:"0 20px 60px rgba(0,0,0,0.45)",position:"relative"}}>
         <div style={{position:"absolute",top:0,left:0,right:0,height:5,background:"#a9762f",borderRadius:"6px 6px 0 0"}}/>
         <h2 style={{fontSize:22,margin:"0 0 20px",fontWeight:400,textAlign:"center"}}>
-          {authMode==="login"?"Welcome back":"Begin your study"}
+          {authMode==="login"?"Welcome back":authMode==="signup"?"Begin your study":authMode==="forgot"?"Reset password":"Create account"}
         </h2>
+        {authMode==="forgot"&&(
+          <p style={{fontSize:13,color:"#6b5d45",marginBottom:16,lineHeight:1.6}}>Enter your email and we'll send you a reset link.</p>
+        )}
         {authMode==="signup"&&(
           <label style={S.label}>Name
             <input style={S.input} value={form.name} onChange={e=>setForm({...form,name:e.target.value})} placeholder="Your name" required/>
@@ -133,17 +182,28 @@ export default function App() {
         <label style={S.label}>Email
           <input style={S.input} type="email" value={form.email} onChange={e=>setForm({...form,email:e.target.value})} placeholder="you@example.com" required/>
         </label>
-        <label style={S.label}>Password
-          <input style={S.input} type="password" value={form.password} onChange={e=>setForm({...form,password:e.target.value})} placeholder="••••••••" required minLength={6}/>
-        </label>
+        {authMode!=="forgot"&&(
+          <label style={S.label}>Password
+            <input style={S.input} type="password" value={form.password} onChange={e=>setForm({...form,password:e.target.value})} placeholder="••••••••" required minLength={6}/>
+          </label>
+        )}
         {authError&&<div style={{color:"#b3422f",fontSize:13,marginBottom:10,padding:"8px 10px",background:"#fdecea",borderRadius:3}}>{authError}</div>}
         <button type="submit" style={S.primaryBtn} disabled={authLoading}>
-          {authLoading?"Please wait…":authMode==="login"?"Log in":"Create account"}
+          {authLoading?"Please wait…":authMode==="login"?"Log in":authMode==="signup"?"Create account":"Send reset link"}
         </button>
         <div style={{textAlign:"center",marginTop:16,fontSize:13}}>
           {authMode==="login"
-            ?<>New here? <a style={S.link} onClick={()=>{setAuthMode("signup");setAuthError("");}}>Create an account</a></>
-            :<>Have an account? <a style={S.link} onClick={()=>{setAuthMode("login");setAuthError("");}}>Log in</a></>}
+            ?<>
+              New here? <a style={S.link} onClick={()=>{setAuthMode("signup");setAuthError("");}}>Create an account</a>
+              <div style={{marginTop:10}}>
+                <a style={{...S.link,color:"#9a8c6f"}} onClick={()=>{setAuthMode("forgot");setAuthError("");}}>Forgot password?</a>
+              </div>
+            </>
+            :authMode==="signup"
+            ?<>Have an account? <a style={S.link} onClick={()=>{setAuthMode("login");setAuthError("");}}>Log in</a></>
+            :authMode==="forgot"
+            ?<><a style={S.link} onClick={()=>{setAuthMode("login");setAuthError("");}}>← Back to login</a></>
+            :null}
         </div>
       </form>
     </div>
@@ -155,6 +215,7 @@ export default function App() {
     {id:"feed",  icon:"🌐",label:"Community"},
     {id:"groups",icon:"👥",label:"Groups"},
     {id:"profile",icon:"👤",label:"Profile"},
+    ...(user?.is_admin?[{id:"admin",icon:"🛡️",label:"Admin"}]:[]),
   ];
 
   return(
@@ -208,12 +269,26 @@ export default function App() {
         </div>
       )}
 
+      {/* Email verification banner */}
+      {user&&user.email_verified===false&&(
+        <div style={{background:"#fff3e0",borderBottom:"1px solid #ffcc80",padding:"10px 16px",
+          display:"flex",alignItems:"center",gap:10,fontSize:13,flexWrap:"wrap"}}>
+          <span>📧</span>
+          <span style={{flex:1,color:"#e65100"}}>Please verify your email address. Check your inbox for a verification link.</span>
+          <button onClick={async()=>{
+            try{await api("/signup",{method:"POST",body:JSON.stringify({resend:true})});}catch{}
+            alert("Verification email resent — check your inbox.");
+          }} style={{...S.primaryBtnSm,background:"#e65100",fontSize:12,padding:"5px 12px"}}>Resend</button>
+        </div>
+      )}
+
       {/* Content */}
       <div style={{flex:1,overflowX:"hidden"}}>
         {tab==="reader" &&<ReaderTab  api={api} user={user} token={token}/>}
         {tab==="feed"   &&<FeedTab    api={api} user={user}/>}
         {tab==="groups" &&<GroupsTab  api={api} user={user}/>}
         {tab==="profile"&&<ProfileTab api={api} user={user} setUser={setUser}/>}
+      {tab==="admin"&&user?.is_admin&&<AdminTab api={api} user={user}/>}
       </div>
 
       {/* Bottom nav (mobile) */}
@@ -228,6 +303,106 @@ export default function App() {
           </button>
         ))}
       </div>
+    </div>
+  );
+}
+
+/* ── REACTION BAR ────────────────────────────────────────────────── */
+function ReactionBar({reactions, onReact, user}) {
+  const [tooltip, setTooltip] = useState(null); // {type, names}
+
+  function buildLabel(r, type) {
+    if (!r || r.count === 0) return null;
+    const reactors = r.reactors || [];
+    const names = reactors.map(u => u.name);
+    const extra = r.count - reactors.length;
+    if (r.mine) {
+      const others = names.filter(n => n !== user?.name);
+      if (r.count === 1) return "You";
+      if (others.length === 0 && extra > 0) return `You and ${extra} others`;
+      if (others.length === 1 && extra === 0) return `You and ${others[0]}`;
+      return `You and ${r.count - 1} others`;
+    }
+    if (names.length === 1 && extra === 0) return names[0];
+    if (names.length === 2 && extra === 0) return `${names[0]} and ${names[1]}`;
+    if (extra > 0) return `${names.slice(0,2).join(", ")} and ${extra} others`;
+    return `${names.join(", ")}`;
+  }
+
+  return(
+    <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center",marginTop:10}}>
+      {RXNS.map(({type,emoji,label})=>{
+        const r = reactions?.[type] || {count:0,mine:false,reactors:[]};
+        const reactors = r.reactors || [];
+        const labelText = buildLabel(r, type);
+        const isActive = tooltip === type;
+
+        return(
+          <div key={type} style={{position:"relative"}}>
+            <button
+              onClick={()=>onReact(type)}
+              onMouseEnter={()=>r.count>0&&setTooltip(type)}
+              onMouseLeave={()=>setTooltip(null)}
+              onTouchStart={()=>r.count>0&&setTooltip(isActive?null:type)}
+              style={{
+                display:"flex",alignItems:"center",gap:5,
+                background:r.mine?"#fbeec1":"#f0ebe0",
+                border:r.mine?"1.5px solid #c9a35c":"1.5px solid #e3d8bf",
+                borderRadius:20,padding:"5px 12px 5px 8px",
+                fontSize:13,cursor:"pointer",color:"#3a2f1e",
+                transition:"all 0.15s",
+                boxShadow:r.mine?"0 1px 4px rgba(169,118,47,0.15)":"none",
+              }}>
+              {/* Stacked avatars */}
+              {reactors.length > 0 && (
+                <div style={{display:"flex",marginRight:2}}>
+                  {reactors.slice(0,3).map((u,i)=>(
+                    <div key={u.id} style={{
+                      width:20,height:20,borderRadius:"50%",
+                      marginLeft: i===0?0:-6,
+                      border:"2px solid",
+                      borderColor:r.mine?"#fbeec1":"#f0ebe0",
+                      zIndex:3-i,position:"relative",flexShrink:0,
+                      background:"#a9762f",overflow:"hidden",
+                    }}>
+                      {u.avatar_url
+                        ? <img src={u.avatar_url} alt={u.name} style={{width:"100%",height:"100%",objectFit:"cover"}}/>
+                        : <div style={{width:"100%",height:"100%",display:"flex",alignItems:"center",justifyContent:"center",
+                            fontSize:9,fontWeight:700,color:"#fff"}}>
+                            {u.name?.[0]?.toUpperCase()}
+                          </div>
+                      }
+                    </div>
+                  ))}
+                </div>
+              )}
+              <span style={{fontSize:16,lineHeight:1}}>{emoji}</span>
+              <span style={{fontSize:12,fontWeight:r.mine?700:400,color:r.mine?"#7a5020":"#5a4a2f"}}>
+                {label}
+                {labelText && <span style={{marginLeft:4,color:"#9a8c6f",fontWeight:400}}>{labelText}</span>}
+              </span>
+            </button>
+
+            {/* Tooltip on hover/tap */}
+            {isActive && r.count > 0 && (
+              <div style={{
+                position:"absolute",bottom:"calc(100% + 6px)",left:"50%",
+                transform:"translateX(-50%)",
+                background:"#2b2419",color:"#f3ecd9",
+                borderRadius:8,padding:"8px 12px",fontSize:12,
+                whiteSpace:"nowrap",zIndex:300,
+                boxShadow:"0 4px 16px rgba(0,0,0,0.25)",
+                maxWidth:220,whiteSpace:"normal",textAlign:"center",lineHeight:1.5,
+              }}>
+                {(r.reactors||[]).map(u=>u.name).join(", ")}
+                {r.count > (r.reactors||[]).length && ` and ${r.count-(r.reactors||[]).length} more`}
+                <div style={{position:"absolute",bottom:-4,left:"50%",transform:"translateX(-50%)",
+                  width:8,height:8,background:"#2b2419",borderRadius:1,rotate:"45deg"}}/>
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -352,12 +527,24 @@ function ReaderTab({api,user,token}) {
 
   useEffect(()=>{
     setVerseData({});setNotes([]);setActiveSelection(null);setReplyState({});
+    // Fetch all 6 versions in one server call (server caches results for 24h)
     VERSIONS.forEach(v=>{
       setVerseData(prev=>({...prev,[v.code]:{loading:true,error:null,verses:[]}}));
-      fetchChapter(book,chapter,v.code)
-        .then(verses=>setVerseData(prev=>({...prev,[v.code]:{loading:false,error:null,verses}})))
-        .catch(err=>setVerseData(prev=>({...prev,[v.code]:{loading:false,error:err.message,verses:[]}})));
     });
+    api(`/bible/${encodeURIComponent(book)}/${chapter}`)
+      .then(data=>{
+        VERSIONS.forEach(v=>{
+          const result=data.results?.[v.code];
+          if(result?.error){
+            setVerseData(prev=>({...prev,[v.code]:{loading:false,error:result.error,verses:[]}}));
+          } else {
+            setVerseData(prev=>({...prev,[v.code]:{loading:false,error:null,verses:result||[]}}));
+          }
+        });
+      })
+      .catch(err=>{
+        VERSIONS.forEach(v=>setVerseData(prev=>({...prev,[v.code]:{loading:false,error:err.message,verses:[]}})));
+      });
     setNotesLoading(true);
     api(`/chapters/${encodeURIComponent(book)}/${chapter}/notes`)
       .then(d=>setNotes(d.notes||[]))
@@ -540,15 +727,7 @@ function ReaderTab({api,user,token}) {
                     </div>
                     {n.quote&&<div style={{fontSize:12.5,fontStyle:"italic",color:"#6b5d45",margin:"2px 0"}}>"{n.quote}"</div>}
                     <div style={{fontSize:14,lineHeight:1.6}}>{n.comment}</div>
-                    <div style={{display:"flex",gap:5,marginTop:8,flexWrap:"wrap"}}>
-                      {RXNS.map(({type,emoji,label})=>{
-                        const r=n.reactions?.[type]||{count:0,mine:false};
-                        return(<button key={type} onClick={()=>handleReact(n.id,type)}
-                          style={{background:r.mine?"#fbeec1":"#f0ebe0",border:r.mine?"1px solid #c9a35c":"1px solid #e3d8bf",
-                            borderRadius:20,padding:"4px 10px",fontSize:12,cursor:"pointer",color:"#5a4a2f"}}>
-                          {emoji} {label}{r.count>0&&<b> {r.count}</b>}
-                        </button>);
-                      })}
+                    <ReactionBar reactions={n.reactions} onReact={(type)=>handleReact(n.id,type)} user={user}/>
                       <button onClick={()=>toggleReply(n.id)}
                         style={{background:"transparent",border:"1px solid #e3d8bf",borderRadius:20,
                           padding:"4px 10px",fontSize:12,cursor:"pointer",color:"#a9762f"}}>
@@ -679,16 +858,7 @@ function FeedTab({api,user}) {
         </div>
         <h2 style={{margin:"0 0 10px",fontWeight:600,fontSize:20,lineHeight:1.3}}>{activePost.title}</h2>
         <p style={{margin:"0 0 16px",lineHeight:1.75,fontSize:15}}>{activePost.body}</p>
-        <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-          {RXNS.map(({type,emoji,label})=>{
-            const r=activePost.reactions?.[type]||{count:0,mine:false};
-            return(<button key={type} onClick={()=>reactToPost(activePost.id,type)}
-              style={{background:r.mine?"#fbeec1":"#f0ebe0",border:r.mine?"1px solid #c9a35c":"1px solid #e3d8bf",
-                borderRadius:20,padding:"6px 14px",fontSize:13,cursor:"pointer",color:"#5a4a2f"}}>
-              {emoji} {label}{r.count>0&&<b> {r.count}</b>}
-            </button>);
-          })}
-        </div>
+        <ReactionBar reactions={activePost.reactions} onReact={(type)=>reactToPost(activePost.id,type)} user={user}/>
       </div>
       <div style={{fontSize:11,letterSpacing:"0.2em",color:"#a9762f",marginBottom:10}}>COMMENTS — {postComments.length}</div>
       {postComments.map(c=>(
@@ -698,16 +868,7 @@ function FeedTab({api,user}) {
             <span style={{fontSize:12,color:"#9a8c6f"}}>{c.author} · {timeAgo(c.created_at)}</span>
           </div>
           <div style={{fontSize:14,lineHeight:1.65,margin:"4px 0"}}>{c.body}</div>
-          <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-            {RXNS.map(({type,emoji})=>{
-              const r=c.reactions?.[type]||{count:0,mine:false};
-              return(<button key={type} onClick={()=>reactToComment(c.id,type)}
-                style={{background:r.mine?"#fbeec1":"transparent",border:r.mine?"1px solid #c9a35c":"1px solid #e3d8bf",
-                  borderRadius:20,padding:"3px 10px",fontSize:12,cursor:"pointer"}}>
-                {emoji}{r.count>0&&` ${r.count}`}
-              </button>);
-            })}
-          </div>
+          <ReactionBar reactions={c.reactions} onReact={(type)=>reactToComment(c.id,type)} user={user}/>
         </div>
       ))}
       <div style={{display:"flex",gap:8,marginTop:16,position:"sticky",bottom:60,background:"#f7f3e8",padding:"8px 0"}}>
@@ -749,14 +910,7 @@ function FeedTab({api,user}) {
           <div style={{fontSize:17,fontWeight:600,marginBottom:6,lineHeight:1.3}}>{p.title}</div>
           <div style={{fontSize:14,lineHeight:1.7,color:"#3a2f1e",marginBottom:14,overflow:"hidden",display:"-webkit-box",WebkitLineClamp:3,WebkitBoxOrient:"vertical"}}>{p.body}</div>
           <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
-            {RXNS.map(({type,emoji,label})=>{
-              const r=p.reactions?.[type]||{count:0,mine:false};
-              return(<button key={type} onClick={e=>{e.stopPropagation();reactToPost(p.id,type);}}
-                style={{background:r.mine?"#fbeec1":"#f0ebe0",border:r.mine?"1px solid #c9a35c":"1px solid #e3d8bf",
-                  borderRadius:20,padding:"5px 12px",fontSize:13,cursor:"pointer",color:"#5a4a2f"}}>
-                {emoji} {label}{r.count>0&&<b> {r.count}</b>}
-              </button>);
-            })}
+            <ReactionBar reactions={p.reactions} onReact={(type)=>reactToPost(p.id,type)} user={user}/>
             <button onClick={()=>openPost(p)}
               style={{background:"transparent",border:"1px solid #e3d8bf",borderRadius:20,
                 padding:"5px 14px",fontSize:13,cursor:"pointer",color:"#a9762f",marginLeft:"auto"}}>
@@ -926,6 +1080,216 @@ function ProfileTab({api,user,setUser}) {
           {form.avatar_url&&<div style={{marginBottom:14,textAlign:"center"}}><Avatar name={form.name} url={form.avatar_url} size={64}/></div>}
           <button type="submit" style={{...S.primaryBtn,marginTop:0}} disabled={saving}>{saving?"Saving…":"Save changes"}</button>
         </form>
+      )}
+    </div>
+  );
+}
+
+/* ── ADMIN TAB ──────────────────────────────────────────────────── */
+function AdminTab({api,user}) {
+  const [activeSection,setActiveSection]=useState("flags");
+  const [data,setData]=useState([]);
+  const [loading,setLoading]=useState(false);
+  const [error,setError]=useState("");
+  const [screenText,setScreenText]=useState("");
+  const [screenResult,setScreenResult]=useState(null);
+  const [screening,setScreening]=useState(false);
+
+  useEffect(()=>{ loadSection(activeSection); },[activeSection]);
+
+  async function loadSection(section) {
+    setLoading(true);setError("");setData([]);
+    try {
+      const map={flags:"/admin/flags",posts:"/admin/posts",comments:"/admin/comments",users:"/admin/users"};
+      const d=await api(map[section]);
+      setData(d[section]||d.flags||d.posts||d.comments||d.users||[]);
+    } catch(e){setError(e.message);}
+    finally{setLoading(false);}
+  }
+
+  async function deleteItem(type,id) {
+    if(!confirm("Are you sure you want to remove this content?"))return;
+    try {
+      await api(`/admin/${type}/${id}`,{method:"DELETE"});
+      setData(prev=>prev.filter(item=>item.id!==id));
+    } catch(e){setError(e.message);}
+  }
+
+  async function toggleAdmin(userId,currentStatus) {
+    try {
+      const d=await api(`/admin/users/${userId}`,{method:"PATCH",body:JSON.stringify({is_admin:!currentStatus})});
+      setData(prev=>prev.map(u=>u.id!==userId?u:{...u,is_admin:d.user.is_admin}));
+    } catch(e){setError(e.message);}
+  }
+
+  async function runScreen(e) {
+    e.preventDefault();if(!screenText.trim())return;
+    setScreening(true);setScreenResult(null);
+    try {
+      const d=await api("/screen",{method:"POST",body:JSON.stringify({text:screenText,context:"manual review"})});
+      setScreenResult(d);
+    } catch(e){setError(e.message);}
+    finally{setScreening(false);}
+  }
+
+  const SECTIONS=[
+    {id:"flags",label:"🚩 Flags"},
+    {id:"posts",label:"📝 Posts"},
+    {id:"comments",label:"💬 Comments"},
+    {id:"users",label:"👥 Users"},
+    {id:"screen",label:"🔍 Screen"},
+  ];
+
+  return(
+    <div style={{maxWidth:780,margin:"0 auto",padding:"16px 12px"}}>
+      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:18}}>
+        <span style={{fontSize:20}}>🛡️</span>
+        <div>
+          <div style={{fontSize:17,fontWeight:700}}>Admin Dashboard</div>
+          <div style={{fontSize:12,color:"#9a8c6f"}}>Moderation & community management</div>
+        </div>
+      </div>
+
+      {error&&<div style={{background:"#f6dede",color:"#8a3b2a",padding:"10px 14px",borderRadius:6,marginBottom:14,fontSize:13}}>{error}</div>}
+
+      {/* Section tabs */}
+      <div style={{display:"flex",gap:6,overflowX:"auto",paddingBottom:10,marginBottom:16,WebkitOverflowScrolling:"touch"}}>
+        {SECTIONS.map(s=>(
+          <button key={s.id} onClick={()=>setActiveSection(s.id)}
+            style={{flexShrink:0,padding:"7px 14px",borderRadius:20,border:"1px solid",cursor:"pointer",
+              fontFamily:"Georgia,serif",fontSize:13,whiteSpace:"nowrap",
+              background:activeSection===s.id?"#2b2419":"#fffdf6",
+              color:activeSection===s.id?"#f3ecd9":"#6b5d45",
+              borderColor:activeSection===s.id?"#2b2419":"#e3d8bf"}}>
+            {s.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Manual screen tool */}
+      {activeSection==="screen"&&(
+        <div>
+          <div style={{fontSize:13,color:"#6b5d45",marginBottom:12,lineHeight:1.6}}>
+            Paste any text below to manually check it against the community safety filter.
+          </div>
+          <form onSubmit={runScreen}>
+            <textarea value={screenText} onChange={e=>setScreenText(e.target.value)}
+              placeholder="Paste content to screen…" rows={5}
+              style={{...S.input,resize:"vertical",marginBottom:10,fontSize:14}}/>
+            <button type="submit" style={{...S.primaryBtnSm,marginBottom:16}} disabled={screening}>
+              {screening?"Checking…":"Run safety check"}
+            </button>
+          </form>
+          {screenResult&&(
+            <div style={{background:screenResult.allowed?"#e8f5e9":"#fdecea",border:`1px solid ${screenResult.allowed?"#a5d6a7":"#f5c6cb"}`,
+              borderRadius:8,padding:16}}>
+              <div style={{fontSize:16,fontWeight:700,marginBottom:6,color:screenResult.allowed?"#2e7d32":"#b71c1c"}}>
+                {screenResult.allowed?"✅ Content approved":"🚫 Content blocked"}
+              </div>
+              {screenResult.reason&&<div style={{fontSize:13,color:"#5a4a2f"}}>{screenResult.reason}</div>}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Flags */}
+      {activeSection==="flags"&&(
+        <div>
+          {loading&&<div style={{color:"#9a8c6f",textAlign:"center",padding:24}}>Loading…</div>}
+          {!loading&&data.length===0&&<div style={{color:"#9a8c6f",textAlign:"center",padding:32}}>No flags yet — community looks clean! 🎉</div>}
+          {data.map(f=>(
+            <div key={f.id} style={{background:"#fffdf6",border:"1px solid #e3d8bf",borderRadius:8,padding:16,marginBottom:10}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:12,color:"#9a8c6f",marginBottom:4}}>
+                    <span style={{background:f.action==="blocked"?"#fdecea":"#fff3e0",color:f.action==="blocked"?"#b71c1c":"#e65100",
+                      padding:"2px 8px",borderRadius:10,fontSize:11,fontWeight:600,marginRight:8}}>
+                      {f.action?.toUpperCase()}
+                    </span>
+                    {f.content_type} · {f.user_name} · {timeAgo(f.created_at)}
+                  </div>
+                  <div style={{fontSize:14,color:"#3a2f1e"}}>{f.reason}</div>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Posts */}
+      {activeSection==="posts"&&(
+        <div>
+          {loading&&<div style={{color:"#9a8c6f",textAlign:"center",padding:24}}>Loading…</div>}
+          {!loading&&data.length===0&&<div style={{color:"#9a8c6f",textAlign:"center",padding:32}}>No posts yet.</div>}
+          {data.map(p=>(
+            <div key={p.id} style={{background:"#fffdf6",border:"1px solid #e3d8bf",borderRadius:8,padding:16,marginBottom:10}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:12,color:"#9a8c6f",marginBottom:4}}>{p.author} · {p.author_email} · {timeAgo(p.created_at)}</div>
+                  <div style={{fontSize:15,fontWeight:600,marginBottom:4}}>{p.title}</div>
+                  <div style={{fontSize:13,color:"#5a4a2f",lineHeight:1.5,overflow:"hidden",display:"-webkit-box",WebkitLineClamp:2,WebkitBoxOrient:"vertical"}}>{p.body}</div>
+                </div>
+                <button onClick={()=>deleteItem("posts",p.id)}
+                  style={{background:"#fdecea",border:"1px solid #f5c6cb",color:"#b71c1c",borderRadius:6,
+                    padding:"6px 12px",fontSize:12,cursor:"pointer",flexShrink:0}}>
+                  🗑 Remove
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Comments */}
+      {activeSection==="comments"&&(
+        <div>
+          {loading&&<div style={{color:"#9a8c6f",textAlign:"center",padding:24}}>Loading…</div>}
+          {!loading&&data.length===0&&<div style={{color:"#9a8c6f",textAlign:"center",padding:32}}>No comments yet.</div>}
+          {data.map(c=>(
+            <div key={c.id} style={{background:"#fffdf6",border:"1px solid #e3d8bf",borderRadius:8,padding:16,marginBottom:10}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:8}}>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:12,color:"#9a8c6f",marginBottom:4}}>{c.author} · on "{c.post_title}" · {timeAgo(c.created_at)}</div>
+                  <div style={{fontSize:14,color:"#3a2f1e",lineHeight:1.5}}>{c.body}</div>
+                </div>
+                <button onClick={()=>deleteItem("comments",c.id)}
+                  style={{background:"#fdecea",border:"1px solid #f5c6cb",color:"#b71c1c",borderRadius:6,
+                    padding:"6px 12px",fontSize:12,cursor:"pointer",flexShrink:0}}>
+                  🗑 Remove
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Users */}
+      {activeSection==="users"&&(
+        <div>
+          {loading&&<div style={{color:"#9a8c6f",textAlign:"center",padding:24}}>Loading…</div>}
+          {data.map((u,i)=>(
+            <div key={u.id} style={{background:"#fffdf6",border:"1px solid #e3d8bf",borderRadius:8,padding:14,marginBottom:10}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:8}}>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:15,fontWeight:600}}>{u.name}
+                    {u.is_admin&&<span style={{marginLeft:8,fontSize:11,background:"#fbeec1",padding:"2px 8px",borderRadius:10,color:"#a9762f"}}>Admin</span>}
+                    {i<5&&<span style={{marginLeft:6,fontSize:10,background:"#e8f5e9",padding:"2px 6px",borderRadius:10,color:"#2e7d32"}}>Founder</span>}
+                  </div>
+                  <div style={{fontSize:12,color:"#9a8c6f"}}>{u.email} · joined {timeAgo(u.created_at)}</div>
+                </div>
+                {u.id!==user.id&&(
+                  <button onClick={()=>toggleAdmin(u.id,u.is_admin)}
+                    style={{background:u.is_admin?"#fff3e0":"#e8f5e9",
+                      border:`1px solid ${u.is_admin?"#ffcc80":"#a5d6a7"}`,
+                      color:u.is_admin?"#e65100":"#2e7d32",
+                      borderRadius:6,padding:"6px 12px",fontSize:12,cursor:"pointer",flexShrink:0}}>
+                    {u.is_admin?"Remove admin":"Make admin"}
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );
